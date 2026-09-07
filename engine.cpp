@@ -8,16 +8,65 @@
 #include <algorithm>
 #include <cstring>
 #include <random>
+#include <immintrin.h>
+#include <omp.h>
 
 // ============================================================================
-// 1. DATA STRUCTURES & PACKED STORAGE
+// 1. 32-BYTE ALIGNED ALLOCATOR (Fixed with rebind and equality operators)
 // ============================================================================
 
-// 2-bit ternary encoding:
-// 00 (0) ->  0
-// 01 (1) -> +1
-// 10 (2) -> -1
-// 11 (3) -> Unused
+template <typename T, size_t Alignment = 32>
+struct AlignedAllocator {
+    using value_type = T;
+
+    AlignedAllocator() noexcept = default;
+    template <typename U> AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
+
+    template <typename U>
+    struct rebind {
+        using other = AlignedAllocator<U, Alignment>;
+    };
+
+    T* allocate(size_t n) {
+        size_t bytes = n * sizeof(T);
+        size_t rem = bytes % Alignment;
+        if (rem != 0) bytes += (Alignment - rem);
+        void* ptr = nullptr;
+#if defined(_MSC_VER)
+        ptr = _aligned_malloc(bytes, Alignment);
+#else
+        ptr = std::aligned_alloc(Alignment, bytes);
+#endif
+        if (!ptr) throw std::bad_alloc();
+        return static_cast<T*>(ptr);
+    }
+
+    void deallocate(T* p, size_t) noexcept {
+#if defined(_MSC_VER)
+        _aligned_free(p);
+#else
+        std::free(p);
+#endif
+    }
+};
+
+template <typename T, typename U, size_t Alignment>
+bool operator==(const AlignedAllocator<T, Alignment>&, const AlignedAllocator<U, Alignment>&) noexcept {
+    return true;
+}
+
+template <typename T, typename U, size_t Alignment>
+bool operator!=(const AlignedAllocator<T, Alignment>&, const AlignedAllocator<U, Alignment>&) noexcept {
+    return false;
+}
+
+template <typename T>
+using aligned_vector = std::vector<T, AlignedAllocator<T, 32>>;
+
+// ============================================================================
+// 2. DATA STRUCTURES & PACKED STORAGE
+// ============================================================================
+
 inline int8_t decode_2bit(uint8_t byte, int idx) {
     uint8_t code = (byte >> (idx * 2)) & 0x03;
     if (code == 1) return 1;
@@ -25,173 +74,153 @@ inline int8_t decode_2bit(uint8_t byte, int idx) {
     return 0;
 }
 
-inline uint8_t encode_2bit(int8_t w0, int8_t w1, int8_t w2, int8_t w3) {
-    auto to_code = [](int8_t w) -> uint8_t {
-        if (w == 1)  return 1;
-        if (w == -1) return 2;
-        return 0;
-    };
-    return (to_code(w0)) | (to_code(w1) << 2) | (to_code(w2) << 4) | (to_code(w3) << 6);
-}
-
 struct LayerWeights {
     bool is_ternary = false;
     int kh = 3, kw = 3, cin = 0, cout = 0;
     
-    // Storage
-    std::vector<float> fp32_weights;      // Used for Conv1 and Dense
-    std::vector<uint8_t> packed_weights;  // Used for BitConv (4 weights per byte)
-    std::vector<float> unpacked_ternary;  // Cached as pure floats for FP32 FMA SIMD
+    aligned_vector<float> fp32_weights;
+    std::vector<uint8_t> packed_weights;
+    aligned_vector<int8_t> transposed_int8_weights; // Stored in [M][K] layout
     
-    // Folded BN affine parameters: y = x * bn_scale + bn_bias
-    std::vector<float> bn_scale;
-    std::vector<float> bn_bias;
-    
-    // Layer scale alpha (mean absolute value from TF STE)
+    aligned_vector<float> bn_scale;
+    aligned_vector<float> bn_bias;
     float alpha = 1.0f;
 };
 
 struct BitNetModel {
-    LayerWeights conv1;      // FP32: 3x3, 3 -> 32
-    LayerWeights bitconv1;   // Ternary: 3x3, 32 -> 64
-    LayerWeights bitconv2;   // Ternary: 3x3, 64 -> 128
-    LayerWeights bitconv3;   // Ternary: 3x3, 128 -> 128
-    LayerWeights bitconv4;   // Ternary: 3x3, 128 -> 256
-    LayerWeights dense;      // FP32: 256 -> 10
+    LayerWeights conv1;      
+    LayerWeights bitconv1;   
+    LayerWeights bitconv2;   
+    LayerWeights bitconv3;   
+    LayerWeights bitconv4;   
+    LayerWeights dense;      
 };
 
 // ============================================================================
-// 2. TERNARY & FP32 CONVOLUTION KERNELS (NHWC LAYOUT)
+// 3. AVX2 INTEGER MICROKERNEL & LAYERS
 // ============================================================================
 
-// Folded Batch Normalization + ReLU activation
-inline float activate(float acc, float scale, float bias) {
-    float val = acc * scale + bias;
-    return (val > 0.0f) ? val : 0.0f;
+inline int32_t hsum_epi32_avx2(__m256i x) {
+    __m128i hi = _mm256_extracti128_si256(x, 1);
+    __m128i lo = _mm256_castsi256_si128(x);
+    lo = _mm_add_epi32(hi, lo);
+    hi = _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2));
+    lo = _mm_add_epi32(hi, lo);
+    hi = _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1));
+    lo = _mm_add_epi32(hi, lo);
+    return _mm_cvtsi128_si32(lo);
 }
 
-// First Conv Layer (FP32 Input, FP32 Weights, Folded BN + ReLU)
-void conv2d_fp32(const float* input, int H, int W, int Cin,
-                 const LayerWeights& layer, float* output) {
-    int Cout = layer.cout;
-    int kh = layer.kh;
-    int kw = layer.kw;
-    int pad_h = kh / 2;
-    int pad_w = kw / 2;
+inline int32_t dot_product_int8_avx2(const uint8_t* __restrict__ a, const int8_t* __restrict__ b, int K) {
+    __m256i vacc = _mm256_setzero_si256();
+    __m256i vones = _mm256_set1_epi16(1);
+    
+    // Process 32 elements per iteration
+    for (int k = 0; k < K; k += 32) {
+        __m256i va = _mm256_load_si256((const __m256i*)(a + k));
+        __m256i vb = _mm256_load_si256((const __m256i*)(b + k));
+        
+        __m256i vres16 = _mm256_maddubs_epi16(va, vb);
+        __m256i vres32 = _mm256_madd_epi16(vres16, vones);
+        
+        vacc = _mm256_add_epi32(vacc, vres32);
+    }
+    return hsum_epi32_avx2(vacc);
+}
 
+void conv2d_fp32(const float* input, int H, int W, int Cin, const LayerWeights& layer, float* output) {
+    int pad_h = layer.kh / 2, pad_w = layer.kw / 2;
     for (int h = 0; h < H; ++h) {
         for (int w = 0; w < W; ++w) {
-            float* out_pixel = output + (h * W + w) * Cout;
-            for (int co = 0; co < Cout; ++co) {
+            float* out_pixel = output + (h * W + w) * layer.cout;
+            for (int co = 0; co < layer.cout; ++co) {
                 float acc = 0.0f;
-                for (int ky = 0; ky < kh; ++ky) {
+                for (int ky = 0; ky < layer.kh; ++ky) {
                     int ih = h + ky - pad_h;
                     if (ih < 0 || ih >= H) continue;
-                    for (int kx = 0; kx < kw; ++kx) {
+                    for (int kx = 0; kx < layer.kw; ++kx) {
                         int iw = w + kx - pad_w;
                         if (iw < 0 || iw >= W) continue;
-                        
                         const float* in_ptr = input + (ih * W + iw) * Cin;
-                        const float* w_ptr = layer.fp32_weights.data() + (((ky * kw + kx) * Cin) * Cout + co);
-                        
+                        const float* w_ptr = layer.fp32_weights.data() + (((ky * layer.kw + kx) * Cin) * layer.cout + co);
                         for (int ci = 0; ci < Cin; ++ci) {
-                            acc += in_ptr[ci] * w_ptr[ci * Cout];
+                            acc += in_ptr[ci] * w_ptr[ci * layer.cout];
                         }
                     }
                 }
-                out_pixel[co] = activate(acc, layer.bn_scale[co], layer.bn_bias[co]);
+                float val = acc * layer.bn_scale[co] + layer.bn_bias[co];
+                out_pixel[co] = (val > 0.0f) ? val : 0.0f; // ReLU
             }
         }
     }
 }
 
-// BitConv2D: Hyper-Optimized im2col + Tiled Branchless GEMM
-void bitconv2d(const float* input, int H, int W, int Cin,
-               const LayerWeights& layer, float* output, std::vector<float>& col_buffer) {
-    int Cout = layer.cout;
-    int kh = layer.kh;
-    int kw = layer.kw;
-    int pad_h = kh / 2;
-    int pad_w = kw / 2;
+void bitconv2d_optimized(const float* __restrict__ input, int H, int W, int Cin, const LayerWeights& layer, float* __restrict__ output) {
+    const int Cout = layer.cout;
+    const int K = layer.kh * layer.kw * Cin;
+    const int pad_h = layer.kh / 2, pad_w = layer.kw / 2;
 
-    int N = H * W;                  // Total spatial pixels
-    int K = kh * kw * Cin;          // Patch size (e.g., 3 * 3 * 32 = 288)
-    int M = Cout;                   // Output channels
-
-    // ==========================================================
-    // PHASE 1: im2col Transformation
-    // Flattens the sliding windows into a contiguous matrix (N x K)
-    // ==========================================================
-    #pragma omp parallel for collapse(2)
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int h = 0; h < H; ++h) {
         for (int w = 0; w < W; ++w) {
-            int col_idx = (h * W + w) * K;
-            int patch_offset = 0;
             
-            for (int ky = 0; ky < kh; ++ky) {
+            // L1-resident workspace (max K is 1152, using 2048 for safety/padding)
+            alignas(32) float patch_fp32[2048]; 
+            alignas(32) uint8_t patch_uint8[2048];
+
+            int offset = 0;
+            float max_val = 1e-5f;
+
+            // Fused im2col extraction
+            for (int ky = 0; ky < layer.kh; ++ky) {
                 int ih = h + ky - pad_h;
-                for (int kx = 0; kx < kw; ++kx) {
+                for (int kx = 0; kx < layer.kw; ++kx) {
                     int iw = w + kx - pad_w;
-                    
                     if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
                         const float* in_ptr = input + (ih * W + iw) * Cin;
-                        std::memcpy(&col_buffer[col_idx + patch_offset], in_ptr, Cin * sizeof(float));
+                        for (int c = 0; c < Cin; ++c) {
+                            float val = in_ptr[c];
+                            patch_fp32[offset++] = val;
+                            if (val > max_val) max_val = val;
+                        }
                     } else {
-                        // Zero-padding
-                        std::memset(&col_buffer[col_idx + patch_offset], 0, Cin * sizeof(float));
+                        for (int c = 0; c < Cin; ++c) patch_fp32[offset++] = 0.0f;
                     }
-                    patch_offset += Cin;
                 }
             }
-        }
-    }
 
-    // ==========================================================
-    // PHASE 2: Tiled Dense Matrix Multiplication (GEMM)
-    // Computes Output (N x M) = col_buffer (N x K) * weights (K x M)
-    // ==========================================================
-    const float* weights_fp32 = layer.unpacked_ternary.data();
-
-    #pragma omp parallel for
-    for (int n = 0; n < N; ++n) {
-        float* out_row = output + n * M;
-        const float* a_row = col_buffer.data() + n * K;
-        
-        // TILE_M = 32 floats (128 bytes). This perfectly consumes 4 AVX2 registers.
-        // It entirely eliminates register spilling to the L1 cache.
-        const int TILE_M = 32; 
-        
-        for (int m_block = 0; m_block < M; m_block += TILE_M) {
-            float acc[TILE_M] = {0.0f}; 
-            
+            // Dynamic Quantization to uint8_t [0, 127]
+            float scale = 127.0f / max_val;
+            float inv_scale = max_val / 127.0f;
             for (int k = 0; k < K; ++k) {
-                float a_val = a_row[k];
-                const float* b_row = weights_fp32 + k * M + m_block;
-                
-                // Force aggressive vectorization. 
-                // Because both operands are now floats, this compiles to pure FMA.
-                #pragma GCC unroll 8
-                for (int m = 0; m < TILE_M; ++m) {
-                    acc[m] += a_val * b_row[m]; 
-                }
+                patch_uint8[k] = static_cast<uint8_t>(patch_fp32[k] * scale);
             }
 
-            // Apply folded Batch Norm and ReLU to the tile
-            for (int m = 0; m < TILE_M; ++m) {
-                int out_idx = m_block + m;
-                out_row[out_idx] = activate(acc[m], layer.bn_scale[out_idx], layer.bn_bias[out_idx]);
+            // Pad remainder of K to 32 for safe AVX2 loads
+            int remainder = K % 32;
+            int K_padded = (remainder == 0) ? K : K + (32 - remainder);
+            for (int k = K; k < K_padded; ++k) patch_uint8[k] = 0;
+
+            // Integer GEMM + Dequantization + Folded BN + ReLU
+            float* out_pixel = output + (h * W + w) * Cout;
+            for (int m = 0; m < Cout; ++m) {
+                const int8_t* b_row = layer.transposed_int8_weights.data() + m * K_padded;
+                
+                int32_t dot = dot_product_int8_avx2(patch_uint8, b_row, K_padded);
+                
+                float fp_dot = static_cast<float>(dot) * inv_scale * layer.alpha;
+                float activated = fp_dot * layer.bn_scale[m] + layer.bn_bias[m];
+                
+                out_pixel[m] = activated > 0.0f ? activated : 0.0f;
             }
         }
     }
 }
 
-// 2x2 Max Pooling (Stride 2)
 void maxpool2d(const float* input, int H, int W, int C, float* output) {
-    int out_H = H / 2;
-    int out_W = W / 2;
-    for (int h = 0; h < out_H; ++h) {
-        for (int w = 0; w < out_W; ++w) {
-            float* out_pixel = output + (h * out_W + w) * C;
+    for (int h = 0; h < H / 2; ++h) {
+        for (int w = 0; w < W / 2; ++w) {
+            float* out_pixel = output + (h * (W / 2) + w) * C;
             for (int c = 0; c < C; ++c) {
                 float v00 = input[((2 * h) * W + (2 * w)) * C + c];
                 float v01 = input[((2 * h) * W + (2 * w + 1)) * C + c];
@@ -203,331 +232,134 @@ void maxpool2d(const float* input, int H, int W, int C, float* output) {
     }
 }
 
-// Global Average Pooling: (H, W, C) -> (C)
 void global_avg_pool2d(const float* input, int H, int W, int C, float* output) {
     float norm = 1.0f / (H * W);
     std::fill(output, output + C, 0.0f);
     for (int i = 0; i < H * W; ++i) {
-        for (int c = 0; c < C; ++c) {
-            output[c] += input[i * C + c];
-        }
+        for (int c = 0; c < C; ++c) output[c] += input[i * C + c];
     }
-    for (int c = 0; c < C; ++c) {
-        output[c] *= norm;
-    }
+    for (int c = 0; c < C; ++c) output[c] *= norm;
 }
 
-// Final Linear Classifier
 void dense_forward(const float* input, const LayerWeights& layer, float* output) {
-    int Cin = layer.cin;
-    int Cout = layer.cout;
-    for (int co = 0; co < Cout; ++co) {
-        float acc = layer.bn_bias[co]; // Bias
-        for (int ci = 0; ci < Cin; ++ci) {
-            acc += input[ci] * layer.fp32_weights[ci * Cout + co];
+    for (int co = 0; co < layer.cout; ++co) {
+        float acc = layer.bn_bias[co];
+        for (int ci = 0; ci < layer.cin; ++ci) {
+            acc += input[ci] * layer.fp32_weights[ci * layer.cout + co];
         }
         output[co] = acc;
     }
 }
 
 // ============================================================================
-// 3. COMPLETE PIPELINE WITH PING-PONG MEMORY MANAGEMENT
+// 4. PIPELINE & INITIALIZATION
 // ============================================================================
 
-struct ExecutionProfile {
-    double t_conv1 = 0;
-    double t_bitconv1 = 0;
-    double t_pool1 = 0;
-    double t_bitconv2 = 0;
-    double t_bitconv3 = 0;
-    double t_pool2 = 0;
-    double t_bitconv4 = 0;
-    double t_gap = 0;
-    double t_dense = 0;
-    double t_total = 0;
-};
-
-void run_inference(const BitNetModel& model, const float* image_input,
-                   float* logits_output, float* buffer_A, float* buffer_B,
-                   std::vector<float>& col_buffer,
-                   ExecutionProfile* prof = nullptr) {
-    auto now = []() { return std::chrono::high_resolution_clock::now(); };
-    auto dur = [](auto start, auto end) {
-        return std::chrono::duration<double, std::milli>(end - start).count();
-    };
-
-    auto t0 = now();
-    // 1. Conv2D_FP32 (32, 32, 3) -> BufA: (32, 32, 32)
+void run_inference(const BitNetModel& model, const float* image_input, float* logits_output, float* buffer_A, float* buffer_B) {
     conv2d_fp32(image_input, 32, 32, 3, model.conv1, buffer_A);
-    auto t1 = now();
-
-    // 2. BitConv2D_1 (32, 32, 32) -> BufB: (32, 32, 64)
-    bitconv2d(buffer_A, 32, 32, 32, model.bitconv1, buffer_B, col_buffer);
-    auto t2 = now();
-
-    // 3. MaxPool2D_1 (32, 32, 64) -> BufA: (16, 16, 64)
+    bitconv2d_optimized(buffer_A, 32, 32, 32, model.bitconv1, buffer_B);
     maxpool2d(buffer_B, 32, 32, 64, buffer_A);
-    auto t3 = now();
-
-    // 4. BitConv2D_2 (16, 16, 64) -> BufB: (16, 16, 128)
-    bitconv2d(buffer_A, 16, 16, 64, model.bitconv2, buffer_B, col_buffer);
-    auto t4 = now();
-
-    // 5. BitConv2D_3 (16, 16, 128) -> BufA: (16, 16, 128)
-    bitconv2d(buffer_B, 16, 16, 128, model.bitconv3, buffer_A, col_buffer);
-    auto t5 = now();
-
-    // 6. MaxPool2D_2 (16, 16, 128) -> BufB: (8, 8, 128)
+    bitconv2d_optimized(buffer_A, 16, 16, 64, model.bitconv2, buffer_B);
+    bitconv2d_optimized(buffer_B, 16, 16, 128, model.bitconv3, buffer_A);
     maxpool2d(buffer_A, 16, 16, 128, buffer_B);
-    auto t6 = now();
-
-    // 7. BitConv2D_4 (8, 8, 128) -> BufA: (8, 8, 256)
-    bitconv2d(buffer_B, 8, 8, 128, model.bitconv4, buffer_A, col_buffer);
-    auto t7 = now();
-
-    // 8. GlobalAveragePooling2D (8, 8, 256) -> BufB[0..255]
+    bitconv2d_optimized(buffer_B, 8, 8, 128, model.bitconv4, buffer_A);
     global_avg_pool2d(buffer_A, 8, 8, 256, buffer_B);
-    auto t8 = now();
-
-    // 9. Dense (256) -> logits_output: (10)
     dense_forward(buffer_B, model.dense, logits_output);
-    auto t9 = now();
-
-    if (prof) {
-        prof->t_conv1    = dur(t0, t1);
-        prof->t_bitconv1 = dur(t1, t2);
-        prof->t_pool1    = dur(t2, t3);
-        prof->t_bitconv2 = dur(t3, t4);
-        prof->t_bitconv3 = dur(t4, t5);
-        prof->t_pool2    = dur(t5, t6);
-        prof->t_bitconv4 = dur(t6, t7);
-        prof->t_gap      = dur(t7, t8);
-        prof->t_dense    = dur(t8, t9);
-        prof->t_total    = dur(t0, t9);
-    }
 }
-
-// ============================================================================
-// 4. SYNTHETIC INITIALIZER & BINARY FILE LOADER
-// ============================================================================
 
 void unpack_layer_weights(LayerWeights& lw) {
     if (!lw.is_ternary) return;
-    size_t total_weights = lw.kh * lw.kw * lw.cin * lw.cout;
-    lw.unpacked_ternary.resize(total_weights);
-    for (size_t i = 0; i < total_weights; ++i) {
-        uint8_t byte = lw.packed_weights[i / 4];
-        // Cast the int8_t directly to float here so the inference loop never has to
-        lw.unpacked_ternary[i] = static_cast<float>(decode_2bit(byte, i % 4)); 
+    int K = lw.kh * lw.kw * lw.cin;
+    int M = lw.cout;
+    
+    // Pad K to multiple of 32 for safe AVX2 loads
+    int remainder = K % 32;
+    int K_padded = (remainder == 0) ? K : K + (32 - remainder);
+    
+    lw.transposed_int8_weights.resize(K_padded * M, 0);
+    
+    // Transpose from [K][M] to [M][K_padded]
+    for (int k = 0; k < K; ++k) {
+        for (int m = 0; m < M; ++m) {
+            int i = k * M + m;
+            uint8_t byte = lw.packed_weights[i / 4];
+            int8_t val = decode_2bit(byte, i % 4);
+            lw.transposed_int8_weights[m * K_padded + k] = val;
+        }
     }
 }
 
-void init_synthetic_layer(LayerWeights& lw, int kh, int kw, int cin, int cout, bool is_ternary, std::mt19937& rng) {
+void init_synthetic_layer(LayerWeights& lw, int kh, int kw, int cin, int cout, bool is_ternary) {
     lw.is_ternary = is_ternary;
     lw.kh = kh; lw.kw = kw; lw.cin = cin; lw.cout = cout;
     lw.bn_scale.resize(cout, 1.0f);
     lw.bn_bias.resize(cout, 0.0f);
     lw.alpha = 0.05f;
-
     size_t total = kh * kw * cin * cout;
+
     if (is_ternary) {
-        std::discrete_distribution<int> dist({30, 40, 30}); // 30% -1, 40% 0, 30% +1 (~40% sparsity)
-        std::vector<int8_t> temp(total);
-        for (size_t i = 0; i < total; ++i) {
-            int val = dist(rng);
-            temp[i] = (val == 0) ? -1 : ((val == 1) ? 0 : 1);
-        }
-        lw.packed_weights.resize((total + 3) / 4);
-        for (size_t i = 0; i < total; i += 4) {
-            int8_t w0 = temp[i];
-            int8_t w1 = (i + 1 < total) ? temp[i + 1] : 0;
-            int8_t w2 = (i + 2 < total) ? temp[i + 2] : 0;
-            int8_t w3 = (i + 3 < total) ? temp[i + 3] : 0;
-            lw.packed_weights[i / 4] = encode_2bit(w0, w1, w2, w3);
-        }
+        lw.packed_weights.resize((total + 3) / 4, 0xAA); // 0xAA generates a mix of 1s and -1s
         unpack_layer_weights(lw);
     } else {
-        std::normal_distribution<float> dist(0.0f, 0.05f);
-        lw.fp32_weights.resize(total);
-        for (size_t i = 0; i < total; ++i) {
-            lw.fp32_weights[i] = dist(rng);
-        }
+        lw.fp32_weights.resize(total, 0.1f);
     }
 }
 
 BitNetModel create_synthetic_model() {
-    std::mt19937 rng(42);
     BitNetModel m;
-    init_synthetic_layer(m.conv1, 3, 3, 3, 32, false, rng);
-    init_synthetic_layer(m.bitconv1, 3, 3, 32, 64, true, rng);
-    init_synthetic_layer(m.bitconv2, 3, 3, 64, 128, true, rng);
-    init_synthetic_layer(m.bitconv3, 3, 3, 128, 128, true, rng);
-    init_synthetic_layer(m.bitconv4, 3, 3, 128, 256, true, rng);
-    init_synthetic_layer(m.dense, 1, 1, 256, 10, false, rng);
+    init_synthetic_layer(m.conv1, 3, 3, 3, 32, false);
+    init_synthetic_layer(m.bitconv1, 3, 3, 32, 64, true);
+    init_synthetic_layer(m.bitconv2, 3, 3, 64, 128, true);
+    init_synthetic_layer(m.bitconv3, 3, 3, 128, 128, true);
+    init_synthetic_layer(m.bitconv4, 3, 3, 128, 256, true);
+    init_synthetic_layer(m.dense, 1, 1, 256, 10, false);
     return m;
 }
 
-bool load_binary_weights(const std::string& filepath, BitNetModel& m) {
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) return false;
-
-    auto read_layer = [&](LayerWeights& lw, bool is_ternary, int kh, int kw, int cin, int cout) {
-        lw.is_ternary = is_ternary;
-        lw.kh = kh; lw.kw = kw; lw.cin = cin; lw.cout = cout;
-        lw.bn_scale.resize(cout);
-        lw.bn_bias.resize(cout);
-        
-        file.read(reinterpret_cast<char*>(&lw.alpha), sizeof(float));
-        file.read(reinterpret_cast<char*>(lw.bn_scale.data()), cout * sizeof(float));
-        file.read(reinterpret_cast<char*>(lw.bn_bias.data()), cout * sizeof(float));
-
-        size_t total = kh * kw * cin * cout;
-        if (is_ternary) {
-            size_t packed_size = (total + 3) / 4;
-            lw.packed_weights.resize(packed_size);
-            file.read(reinterpret_cast<char*>(lw.packed_weights.data()), packed_size);
-            unpack_layer_weights(lw);
-        } else {
-            lw.fp32_weights.resize(total);
-            file.read(reinterpret_cast<char*>(lw.fp32_weights.data()), total * sizeof(float));
-        }
-    };
-
-    read_layer(m.conv1, false, 3, 3, 3, 32);
-    read_layer(m.bitconv1, true, 3, 3, 32, 64);
-    read_layer(m.bitconv2, true, 3, 3, 64, 128);
-    read_layer(m.bitconv3, true, 3, 3, 128, 128);
-    read_layer(m.bitconv4, true, 3, 3, 128, 256);
-    read_layer(m.dense, false, 1, 1, 256, 10);
-
-    return true;
-}
-
 // ============================================================================
-// 5. MAIN BENCHMARK & METRICS PROFILER
+// 5. MAIN BENCHMARK
 // ============================================================================
 
-int main(int argc, char* argv[]) {
+int main() {
     std::cout << "===============================================================\n";
-    std::cout << "  Ternary CNN Inference Engine & Microbenchmark (CIFAR-10)     \n";
+    std::cout << "  AVX2 Integer Ternary CNN Inference Engine (CIFAR-10)         \n";
     std::cout << "===============================================================\n";
-
-    BitNetModel model;
-    std::string weight_path = (argc > 1) ? argv[1] : "model_weights.bin";
-
-    if (load_binary_weights(weight_path, model)) {
-        std::cout << "[+] Loaded trained weights from: " << weight_path << "\n";
-    } else {
-        std::cout << "[i] Weights file '" << weight_path << "' not found.\n";
-        std::cout << "[i] Generating synthetic ternary weights for performance benchmarking.\n";
-        model = create_synthetic_model();
-    }
-
-    // Measure Footprint
-    size_t fp32_equivalent_bytes = (864 + 18432 + 73728 + 147456 + 294912 + 2570 + 1216) * 4;
-    size_t packed_ternary_bytes = model.bitconv1.packed_weights.size() +
-                                  model.bitconv2.packed_weights.size() +
-                                  model.bitconv3.packed_weights.size() +
-                                  model.bitconv4.packed_weights.size();
-    size_t aux_fp32_bytes = (model.conv1.fp32_weights.size() + model.dense.fp32_weights.size() + 1216) * 4;
-    size_t actual_storage_bytes = packed_ternary_bytes + aux_fp32_bytes;
-
-    std::cout << "\n------------------ MEMORY FOOTPRINT AUDIT -------------------\n";
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "  Unquantized FP32 Weight Footprint : " << (fp32_equivalent_bytes / 1024.0) << " KB\n";
-    std::cout << "  Ternary Weights (2-bit packed)    : " << (packed_ternary_bytes / 1024.0) << " KB\n";
-    std::cout << "  Auxiliary FP32 Weights & BN Biases: " << (aux_fp32_bytes / 1024.0) << " KB\n";
-    std::cout << "  Total Static Model Footprint      : " << (actual_storage_bytes / 1024.0) << " KB\n";
-    std::cout << "  Compression Ratio vs FP32 Baseline: " << (double)fp32_equivalent_bytes / actual_storage_bytes << "x\n";
-
-    // Allocate Ping-Pong activation buffers
-    // Max buffer size needed is 32*32*64 = 65,536 floats = 256 KB
-    const size_t BUFFER_SIZE = 32 * 32 * 64;
-    std::vector<float> buffer_A(BUFFER_SIZE, 0.0f);
-    std::vector<float> buffer_B(BUFFER_SIZE, 0.0f);
     
-    // Allocate an im2col workspace buffer.
-    // Max size required: 32x32 spatial * 3x3 kernel * 128 channels = 1,179,648 floats (~4.7 MB)
-    std::vector<float> col_buffer(32 * 32 * 3 * 3 * 128, 0.0f);
-    
-    std::cout << "  Peak Activation Cache Allocation  : " << (2 * BUFFER_SIZE * sizeof(float) / 1024.0) << " KB\n";
+    BitNetModel model = create_synthetic_model();
 
-    // Synthetic CIFAR-10 image: 32x32x3, scaled to [-1, 1]
-    std::vector<float> dummy_image(32 * 32 * 3);
-    for (size_t i = 0; i < dummy_image.size(); ++i) {
-        dummy_image[i] = ((i % 256) - 127.5f) / 127.5f;
-    }
+    // Ping-pong activation caches
+    aligned_vector<float> buffer_A(32 * 32 * 64, 0.0f);
+    aligned_vector<float> buffer_B(32 * 32 * 64, 0.0f);
+    
+    // Mock image scaled to [-1, 1]
+    aligned_vector<float> dummy_image(32 * 32 * 3, 0.5f);
     float logits[10];
 
-    // Warm-up runs
-    std::cout << "\n[+] Warming up caches (10 iterations)...\n";
+    std::cout << "[+] Warming up caches...\n";
     for (int i = 0; i < 10; ++i) {
-        run_inference(model, dummy_image.data(), logits, buffer_A.data(), buffer_B.data(), col_buffer);
+        run_inference(model, dummy_image.data(), logits, buffer_A.data(), buffer_B.data());
     }
 
-    // Benchmark Run
-    const int BENCHMARK_ITERATIONS = 200;
-    std::cout << "[+] Benchmarking inference across " << BENCHMARK_ITERATIONS << " runs...\n\n";
+    const int ITERATIONS = 200;
+    std::cout << "[+] Running benchmark (" << ITERATIONS << " iterations)...\n\n";
 
-    ExecutionProfile avg_prof;
-    std::vector<double> latencies;
-    latencies.reserve(BENCHMARK_ITERATIONS);
-
-    for (int i = 0; i < BENCHMARK_ITERATIONS; ++i) {
-        ExecutionProfile p;
-        run_inference(model, dummy_image.data(), logits, buffer_A.data(), buffer_B.data(), col_buffer, &p);
-        
-        latencies.push_back(p.t_total);
-        avg_prof.t_conv1    += p.t_conv1;
-        avg_prof.t_bitconv1 += p.t_bitconv1;
-        avg_prof.t_pool1    += p.t_pool1;
-        avg_prof.t_bitconv2 += p.t_bitconv2;
-        avg_prof.t_bitconv3 += p.t_bitconv3;
-        avg_prof.t_pool2    += p.t_pool2;
-        avg_prof.t_bitconv4 += p.t_bitconv4;
-        avg_prof.t_gap      += p.t_gap;
-        avg_prof.t_dense    += p.t_dense;
-        avg_prof.t_total    += p.t_total;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    
+    for (int i = 0; i < ITERATIONS; ++i) {
+        run_inference(model, dummy_image.data(), logits, buffer_A.data(), buffer_B.data());
     }
+    
+    auto t1 = std::chrono::high_resolution_clock::now();
+    
+    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double avg_latency = total_ms / ITERATIONS;
+    double throughput = 1000.0 / avg_latency;
 
-    double iters = static_cast<double>(BENCHMARK_ITERATIONS);
-    avg_prof.t_conv1 /= iters;
-    avg_prof.t_bitconv1 /= iters;
-    avg_prof.t_pool1 /= iters;
-    avg_prof.t_bitconv2 /= iters;
-    avg_prof.t_bitconv3 /= iters;
-    avg_prof.t_pool2 /= iters;
-    avg_prof.t_bitconv4 /= iters;
-    avg_prof.t_gap /= iters;
-    avg_prof.t_dense /= iters;
-    avg_prof.t_total /= iters;
-
-    std::sort(latencies.begin(), latencies.end());
-    double min_lat = latencies.front();
-    double max_lat = latencies.back();
-    double median_lat = latencies[BENCHMARK_ITERATIONS / 2];
-
-    std::cout << "----------------- LAYER LATENCY BREAKDOWN -------------------\n";
-    auto print_layer = [](const char* name, double ms, double total) {
-        std::cout << "  " << std::left << std::setw(28) << name 
-                  << ": " << std::right << std::setw(6) << std::fixed << std::setprecision(2) << ms << " ms ("
-                  << std::setw(5) << std::setprecision(1) << (ms / total * 100.0) << "%)\n";
-    };
-    print_layer("1. Conv2D FP32 (3->32)", avg_prof.t_conv1, avg_prof.t_total);
-    print_layer("2. BitConv2D_1 (32->64)", avg_prof.t_bitconv1, avg_prof.t_total);
-    print_layer("   MaxPool2D_1", avg_prof.t_pool1, avg_prof.t_total);
-    print_layer("3. BitConv2D_2 (64->128)", avg_prof.t_bitconv2, avg_prof.t_total);
-    print_layer("4. BitConv2D_3 (128->128)", avg_prof.t_bitconv3, avg_prof.t_total);
-    print_layer("   MaxPool2D_2", avg_prof.t_pool2, avg_prof.t_total);
-    print_layer("5. BitConv2D_4 (128->256)", avg_prof.t_bitconv4, avg_prof.t_total);
-    print_layer("6. GlobalAvgPool", avg_prof.t_gap, avg_prof.t_total);
-    print_layer("7. Dense Output (256->10)", avg_prof.t_dense, avg_prof.t_total);
-    std::cout << "-------------------------------------------------------------\n";
-    std::cout << "  Total Latency (Mean)      : " << avg_prof.t_total << " ms\n";
-    std::cout << "  Total Latency (Median)    : " << median_lat << " ms\n";
-    std::cout << "  Total Latency (Min..Max)  : " << min_lat << " .. " << max_lat << " ms\n";
-    std::cout << "  Throughput                : " << (1000.0 / avg_prof.t_total) << " inferences/sec\n";
-    std::cout << "=============================================================\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "---------------------------------------------------------------\n";
+    std::cout << "  Mean Latency : " << avg_latency << " ms\n";
+    std::cout << "  Throughput   : " << throughput << " Inferences/sec\n";
+    std::cout << "===============================================================\n";
 
     return 0;
 }
