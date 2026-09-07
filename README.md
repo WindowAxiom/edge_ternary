@@ -73,8 +73,7 @@ Weights in `{-1, 0, +1}` are bit-packed at 4 weights per `uint8_t`:
 ## Engine Optimization Techniques
 
 * **Folded Batch Normalization:**
-  Batch normalization scale ($\gamma$), variance ($\sigma^2$), mean ($\mu$), and bias ($\beta$) are folded directly into affine coefficients prior to inference:
-  $$y = x \cdot \text{scale}_{\text{folded}} + \text{bias}_{\text{folded}}$$
+  Batch normalization scale ($\gamma$), variance ($\sigma^2$), mean ($\mu$), and bias ($\beta$) are folded directly into affine coefficients prior to inference:`y = x * scale_folded + bias_folded`
 * **NHWC Memory Layout:**
   Tensors are organized in channel-last (`NHWC`) order, maximizing sequential memory access along inner filter loops and aligning vector loads.
 * **Tiled Branchless Matrix Multiplication:**
