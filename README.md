@@ -2,7 +2,7 @@
 
 An end-to-end implementation of a 1.58-bit (ternary $\{-1, 0, +1\}$) convolutional neural network trained on CIFAR-10 using Knowledge Distillation, paired with a custom, dependency-free C++17 inference engine optimized for x86 CPU architectures.
 
-The engine achieves a **14.17x model footprint reduction** and a **5x inference speedup over TensorFlow CPU**, while maintaining **89.0% test accuracy** through ResNet-20 teacher distillation.
+The engine achieves a **14.17x model footprint reduction** and a **5x inference speedup over TensorFlow CPU**, while maintaining **89.0% test accuracy** through ResNet-50 teacher distillation.
 
 ---
 
