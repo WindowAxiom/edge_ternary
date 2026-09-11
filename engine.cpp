@@ -12,7 +12,7 @@
 #include <omp.h>
 
 // ============================================================================
-// 1. 32-BYTE ALIGNED ALLOCATOR (Fixed with rebind and equality operators)
+// 1. CROSS-PLATFORM 32-BYTE ALIGNED ALLOCATOR
 // ============================================================================
 
 template <typename T, size_t Alignment = 32>
@@ -64,7 +64,7 @@ template <typename T>
 using aligned_vector = std::vector<T, AlignedAllocator<T, 32>>;
 
 // ============================================================================
-// 2. DATA STRUCTURES & PACKED STORAGE
+// 2. DATA STRUCTURES
 // ============================================================================
 
 inline int8_t decode_2bit(uint8_t byte, int idx) {
@@ -80,7 +80,7 @@ struct LayerWeights {
     
     aligned_vector<float> fp32_weights;
     std::vector<uint8_t> packed_weights;
-    aligned_vector<int8_t> transposed_int8_weights; // Stored in [M][K] layout
+    aligned_vector<int8_t> transposed_int8_weights; 
     
     aligned_vector<float> bn_scale;
     aligned_vector<float> bn_bias;
@@ -88,16 +88,11 @@ struct LayerWeights {
 };
 
 struct BitNetModel {
-    LayerWeights conv1;      
-    LayerWeights bitconv1;   
-    LayerWeights bitconv2;   
-    LayerWeights bitconv3;   
-    LayerWeights bitconv4;   
-    LayerWeights dense;      
+    LayerWeights conv1, bitconv1, bitconv2, bitconv3, bitconv4, dense;
 };
 
 // ============================================================================
-// 3. AVX2 INTEGER MICROKERNEL & LAYERS
+// 3. AVX2 INTEGER MICROKERNEL & VECTORIZED POST-PROCESSING
 // ============================================================================
 
 inline int32_t hsum_epi32_avx2(__m256i x) {
@@ -109,23 +104,6 @@ inline int32_t hsum_epi32_avx2(__m256i x) {
     hi = _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1));
     lo = _mm_add_epi32(hi, lo);
     return _mm_cvtsi128_si32(lo);
-}
-
-inline int32_t dot_product_int8_avx2(const uint8_t* __restrict__ a, const int8_t* __restrict__ b, int K) {
-    __m256i vacc = _mm256_setzero_si256();
-    __m256i vones = _mm256_set1_epi16(1);
-    
-    // Process 32 elements per iteration
-    for (int k = 0; k < K; k += 32) {
-        __m256i va = _mm256_load_si256((const __m256i*)(a + k));
-        __m256i vb = _mm256_load_si256((const __m256i*)(b + k));
-        
-        __m256i vres16 = _mm256_maddubs_epi16(va, vb);
-        __m256i vres32 = _mm256_madd_epi16(vres16, vones);
-        
-        vacc = _mm256_add_epi32(vacc, vres32);
-    }
-    return hsum_epi32_avx2(vacc);
 }
 
 void conv2d_fp32(const float* input, int H, int W, int Cin, const LayerWeights& layer, float* output) {
@@ -143,13 +121,11 @@ void conv2d_fp32(const float* input, int H, int W, int Cin, const LayerWeights& 
                         if (iw < 0 || iw >= W) continue;
                         const float* in_ptr = input + (ih * W + iw) * Cin;
                         const float* w_ptr = layer.fp32_weights.data() + (((ky * layer.kw + kx) * Cin) * layer.cout + co);
-                        for (int ci = 0; ci < Cin; ++ci) {
-                            acc += in_ptr[ci] * w_ptr[ci * layer.cout];
-                        }
+                        for (int ci = 0; ci < Cin; ++ci) acc += in_ptr[ci] * w_ptr[ci * layer.cout];
                     }
                 }
                 float val = acc * layer.bn_scale[co] + layer.bn_bias[co];
-                out_pixel[co] = (val > 0.0f) ? val : 0.0f; // ReLU
+                out_pixel[co] = (val > 0.0f) ? val : 0.0f;
             }
         }
     }
@@ -160,18 +136,20 @@ void bitconv2d_optimized(const float* __restrict__ input, int H, int W, int Cin,
     const int K = layer.kh * layer.kw * Cin;
     const int pad_h = layer.kh / 2, pad_w = layer.kw / 2;
 
+    int remainder = K % 32;
+    const int K_padded = (remainder == 0) ? K : K + (32 - remainder);
+
     #pragma omp parallel for collapse(2) schedule(static)
     for (int h = 0; h < H; ++h) {
         for (int w = 0; w < W; ++w) {
             
-            // L1-resident workspace (max K is 1152, using 2048 for safety/padding)
             alignas(32) float patch_fp32[2048]; 
             alignas(32) uint8_t patch_uint8[2048];
 
             int offset = 0;
             float max_val = 1e-5f;
 
-            // Fused im2col extraction
+            // 1. Fused im2col extraction into L1 cache
             for (int ky = 0; ky < layer.kh; ++ky) {
                 int ih = h + ky - pad_h;
                 for (int kx = 0; kx < layer.kw; ++kx) {
@@ -189,29 +167,65 @@ void bitconv2d_optimized(const float* __restrict__ input, int H, int W, int Cin,
                 }
             }
 
-            // Dynamic Quantization to uint8_t [0, 127]
+            // 2. Dynamic Quantization
             float scale = 127.0f / max_val;
             float inv_scale = max_val / 127.0f;
             for (int k = 0; k < K; ++k) {
                 patch_uint8[k] = static_cast<uint8_t>(patch_fp32[k] * scale);
             }
-
-            // Pad remainder of K to 32 for safe AVX2 loads
-            int remainder = K % 32;
-            int K_padded = (remainder == 0) ? K : K + (32 - remainder);
             for (int k = K; k < K_padded; ++k) patch_uint8[k] = 0;
 
-            // Integer GEMM + Dequantization + Folded BN + ReLU
             float* out_pixel = output + (h * W + w) * Cout;
-            for (int m = 0; m < Cout; ++m) {
-                const int8_t* b_row = layer.transposed_int8_weights.data() + m * K_padded;
-                
-                int32_t dot = dot_product_int8_avx2(patch_uint8, b_row, K_padded);
-                
-                float fp_dot = static_cast<float>(dot) * inv_scale * layer.alpha;
-                float activated = fp_dot * layer.bn_scale[m] + layer.bn_bias[m];
-                
-                out_pixel[m] = activated > 0.0f ? activated : 0.0f;
+            const __m256i vones = _mm256_set1_epi16(1);
+            const __m256 v_zero = _mm256_setzero_ps();
+            const __m256 v_inv_scale = _mm256_set1_ps(inv_scale * layer.alpha);
+
+            // 3. 1x8 Register-Blocked GEMM & Vectorized BN/ReLU
+            // Processes 8 output channels simultaneously, cutting L1 reads by 8x.
+            // Safe without bounds check because output channels (32, 64, 128, 256) are multiples of 8.
+            for (int m = 0; m < Cout; m += 8) {
+                __m256i vacc_0 = _mm256_setzero_si256();
+                __m256i vacc_1 = _mm256_setzero_si256();
+                __m256i vacc_2 = _mm256_setzero_si256();
+                __m256i vacc_3 = _mm256_setzero_si256();
+                __m256i vacc_4 = _mm256_setzero_si256();
+                __m256i vacc_5 = _mm256_setzero_si256();
+                __m256i vacc_6 = _mm256_setzero_si256();
+                __m256i vacc_7 = _mm256_setzero_si256();
+
+                const int8_t* b_ptr = layer.transposed_int8_weights.data() + m * K_padded;
+
+                for (int k = 0; k < K_padded; k += 32) {
+                    __m256i va = _mm256_load_si256((const __m256i*)(patch_uint8 + k));
+                    
+                    vacc_0 = _mm256_add_epi32(vacc_0, _mm256_madd_epi16(_mm256_maddubs_epi16(va, _mm256_load_si256((const __m256i*)(b_ptr + 0 * K_padded + k))), vones));
+                    vacc_1 = _mm256_add_epi32(vacc_1, _mm256_madd_epi16(_mm256_maddubs_epi16(va, _mm256_load_si256((const __m256i*)(b_ptr + 1 * K_padded + k))), vones));
+                    vacc_2 = _mm256_add_epi32(vacc_2, _mm256_madd_epi16(_mm256_maddubs_epi16(va, _mm256_load_si256((const __m256i*)(b_ptr + 2 * K_padded + k))), vones));
+                    vacc_3 = _mm256_add_epi32(vacc_3, _mm256_madd_epi16(_mm256_maddubs_epi16(va, _mm256_load_si256((const __m256i*)(b_ptr + 3 * K_padded + k))), vones));
+                    vacc_4 = _mm256_add_epi32(vacc_4, _mm256_madd_epi16(_mm256_maddubs_epi16(va, _mm256_load_si256((const __m256i*)(b_ptr + 4 * K_padded + k))), vones));
+                    vacc_5 = _mm256_add_epi32(vacc_5, _mm256_madd_epi16(_mm256_maddubs_epi16(va, _mm256_load_si256((const __m256i*)(b_ptr + 5 * K_padded + k))), vones));
+                    vacc_6 = _mm256_add_epi32(vacc_6, _mm256_madd_epi16(_mm256_maddubs_epi16(va, _mm256_load_si256((const __m256i*)(b_ptr + 6 * K_padded + k))), vones));
+                    vacc_7 = _mm256_add_epi32(vacc_7, _mm256_madd_epi16(_mm256_maddubs_epi16(va, _mm256_load_si256((const __m256i*)(b_ptr + 7 * K_padded + k))), vones));
+                }
+
+                // Compile 8 scalar dots into a single YMM register
+                __m256i v_dots = _mm256_setr_epi32(
+                    hsum_epi32_avx2(vacc_0), hsum_epi32_avx2(vacc_1),
+                    hsum_epi32_avx2(vacc_2), hsum_epi32_avx2(vacc_3),
+                    hsum_epi32_avx2(vacc_4), hsum_epi32_avx2(vacc_5),
+                    hsum_epi32_avx2(vacc_6), hsum_epi32_avx2(vacc_7)
+                );
+
+                // Hardware cast INT32 -> FP32, then multiply by combined scale
+                __m256 v_fp = _mm256_cvtepi32_ps(v_dots);
+                v_fp = _mm256_mul_ps(v_fp, v_inv_scale);
+
+                // Fused AVX2 Batch Norm + Max(0) ReLU
+                __m256 v_bn_scale = _mm256_load_ps(layer.bn_scale.data() + m);
+                __m256 v_bn_bias  = _mm256_load_ps(layer.bn_bias.data() + m);
+                __m256 v_out = _mm256_max_ps(v_zero, _mm256_fmadd_ps(v_fp, v_bn_scale, v_bn_bias));
+
+                _mm256_store_ps(out_pixel + m, v_out);
             }
         }
     }
@@ -272,13 +286,11 @@ void unpack_layer_weights(LayerWeights& lw) {
     int K = lw.kh * lw.kw * lw.cin;
     int M = lw.cout;
     
-    // Pad K to multiple of 32 for safe AVX2 loads
     int remainder = K % 32;
     int K_padded = (remainder == 0) ? K : K + (32 - remainder);
     
     lw.transposed_int8_weights.resize(K_padded * M, 0);
     
-    // Transpose from [K][M] to [M][K_padded]
     for (int k = 0; k < K; ++k) {
         for (int m = 0; m < M; ++m) {
             int i = k * M + m;
@@ -298,7 +310,7 @@ void init_synthetic_layer(LayerWeights& lw, int kh, int kw, int cin, int cout, b
     size_t total = kh * kw * cin * cout;
 
     if (is_ternary) {
-        lw.packed_weights.resize((total + 3) / 4, 0xAA); // 0xAA generates a mix of 1s and -1s
+        lw.packed_weights.resize((total + 3) / 4, 0xAA);
         unpack_layer_weights(lw);
     } else {
         lw.fp32_weights.resize(total, 0.1f);
@@ -323,15 +335,13 @@ BitNetModel create_synthetic_model() {
 int main() {
     std::cout << "===============================================================\n";
     std::cout << "  AVX2 Integer Ternary CNN Inference Engine (CIFAR-10)         \n";
+    std::cout << "  Optimizations: 32-Byte Aligned, 1x8 Reg Block, AVX2 Fused BN \n";
     std::cout << "===============================================================\n";
     
     BitNetModel model = create_synthetic_model();
 
-    // Ping-pong activation caches
     aligned_vector<float> buffer_A(32 * 32 * 64, 0.0f);
     aligned_vector<float> buffer_B(32 * 32 * 64, 0.0f);
-    
-    // Mock image scaled to [-1, 1]
     aligned_vector<float> dummy_image(32 * 32 * 3, 0.5f);
     float logits[10];
 
@@ -340,7 +350,7 @@ int main() {
         run_inference(model, dummy_image.data(), logits, buffer_A.data(), buffer_B.data());
     }
 
-    const int ITERATIONS = 200;
+    const int ITERATIONS = 20000;
     std::cout << "[+] Running benchmark (" << ITERATIONS << " iterations)...\n\n";
 
     auto t0 = std::chrono::high_resolution_clock::now();
