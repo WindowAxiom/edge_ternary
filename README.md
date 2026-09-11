@@ -2,7 +2,7 @@
 
 An end-to-end implementation of a 1.58-bit (ternary $\{-1, 0, +1\}$) convolutional neural network trained on CIFAR-10 using Knowledge Distillation, paired with a custom, dependency-free C++17 inference engine optimized for x86 CPU architectures.
 
-The engine achieves a **14.17x model footprint reduction** and a **5x inference speedup over TensorFlow CPU**, while maintaining **89.0% test accuracy** through ResNet-50 teacher distillation.
+The engine achieves a **14.17x model footprint reduction** and a **8.03x inference speedup over TensorFlow CPU**, while maintaining **90.0% test accuracy** through ResNet-50 teacher distillation.
 
 ---
 
@@ -13,7 +13,7 @@ All benchmarks were evaluated on a single CIFAR-10 image forward pass ($32 \time
 | Metric | Baseline TensorFlow (FP32) | BitNet C++ Engine (Ternary + FP32) | Delta / Factor |
 | :--- | :--- | :--- | :--- |
 | **Model Weight Footprint** | 2,161.58 KB (~2.11 MB) | 152.23 KB | **14.17x reduction** (92.9% smaller) |
-| **Inference Latency (CPU)** | Baseline (~1.0x) | Optimized (~8.03x) | **5.0x faster** |
+| **Inference Latency (CPU)** | Baseline (~1.0x) | Optimized (~8.03x) | **8.03x faster** |
 | **CIFAR-10 Test Accuracy** | ~92.5% (Teacher ResNet-50) | 90.0% (Student Ternary CNN) | -2.5% degradation |
 | **Weight Quantization** | 32-bit float | 1.58-bit (2-bit packed storage) | 16x theoretical bits per weight |
 | **External Runtime Dependencies** | Python, TensorFlow, oneDNN | Pure C++ Standard Library, OpenMP | Zero third-party inference dependencies |
